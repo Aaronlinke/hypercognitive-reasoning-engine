@@ -1,0 +1,53 @@
+"""Öffentliche API der HyperCognitive Reasoning Engine."""
+
+from .core import (
+    AxiomParadigm,
+    AuditEvent,
+    BranchFinding,
+    CognitiveRule,
+    Conflict,
+    DerivationRecord,
+    EngineError,
+    GoalMetricProfile,
+    InferenceBudget,
+    InferenceReport,
+    MAX_INTENSITY,
+    MindFact,
+    ResonanceEdge,
+    SemanticDimensions,
+    SynthesisFinding,
+    SynthesisResult,
+    TeleologicalGoal,
+    UniverseBranch,
+    UniversalBrainCore,
+    generate_combinatorial_rules,
+    make_fact,
+    make_implication_rule,
+)
+
+__version__ = "1.0.0"
+
+__all__ = [
+    "AxiomParadigm",
+    "AuditEvent",
+    "BranchFinding",
+    "CognitiveRule",
+    "Conflict",
+    "DerivationRecord",
+    "EngineError",
+    "GoalMetricProfile",
+    "InferenceBudget",
+    "InferenceReport",
+    "MAX_INTENSITY",
+    "MindFact",
+    "ResonanceEdge",
+    "SemanticDimensions",
+    "SynthesisFinding",
+    "SynthesisResult",
+    "TeleologicalGoal",
+    "UniverseBranch",
+    "UniversalBrainCore",
+    "generate_combinatorial_rules",
+    "make_fact",
+    "make_implication_rule",
+]
