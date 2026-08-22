@@ -62,6 +62,12 @@ def build_demo_engine() -> UniversalBrainCore:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Führt eine lokale HyperCognitive-Engine-Demo aus.")
     parser.add_argument("--export", type=Path, help="Optionaler Zielpfad für den JSON-Audit-Export.")
+    parser.add_argument("--state-export", type=Path, help="Optionaler Zielpfad für den versionierten Zustands-Export.")
+    parser.add_argument(
+        "--state-without-audit",
+        action="store_true",
+        help="Schließt Audit-Ereignisse aus dem optionalen Zustands-Export aus.",
+    )
     args = parser.parse_args()
 
     engine = build_demo_engine()
@@ -83,6 +89,14 @@ def main() -> int:
         args.export.parent.mkdir(parents=True, exist_ok=True)
         args.export.write_text(engine.export_audit(), encoding="utf-8")
         print(f"Audit-Export: {args.export}")
+    if args.state_export:
+        args.state_export.parent.mkdir(parents=True, exist_ok=True)
+        args.state_export.write_text(
+            engine.export_state(include_audit=not args.state_without_audit), encoding="utf-8"
+        )
+        print(f"Zustands-Export: {args.state_export}")
+    integrity = engine.inspect_integrity()
+    print(f"Integrität: {'OK' if integrity.valid else 'FEHLER'}; Digest: {integrity.state_digest[:16]}…")
     return 0
 
 

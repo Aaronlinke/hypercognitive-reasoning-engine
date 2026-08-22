@@ -8,10 +8,14 @@ from .core import (
     Conflict,
     DerivationRecord,
     EngineError,
+    ExplanationNode,
+    FactConflict,
     GoalMetricProfile,
+    IntegrityReport,
     InferenceBudget,
     InferenceReport,
     MAX_INTENSITY,
+    STATE_SCHEMA,
     MindFact,
     ResonanceEdge,
     SemanticDimensions,
@@ -25,7 +29,7 @@ from .core import (
     make_implication_rule,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "AxiomParadigm",
@@ -35,10 +39,14 @@ __all__ = [
     "Conflict",
     "DerivationRecord",
     "EngineError",
+    "ExplanationNode",
+    "FactConflict",
     "GoalMetricProfile",
+    "IntegrityReport",
     "InferenceBudget",
     "InferenceReport",
     "MAX_INTENSITY",
+    "STATE_SCHEMA",
     "MindFact",
     "ResonanceEdge",
     "SemanticDimensions",

@@ -9,6 +9,7 @@ from hypercognitive_engine import (
     AxiomParadigm,
     BranchFinding,
     CognitiveRule,
+    EngineError,
     GoalMetricProfile,
     InferenceBudget,
     MindFact,
@@ -308,6 +309,110 @@ class SynthesisAndExportTests(unittest.TestCase):
         self.assertNotIn("action", payload["rules"][0])
         self.assertNotIn("condition", payload["rules"][0])
         self.assertTrue(payload["derivations"])
+
+
+class PersistenceAndObservabilityTests(unittest.TestCase):
+    def _engine_with_state(self) -> UniversalBrainCore:
+        engine = UniversalBrainCore()
+        engine.add_goal(TeleologicalGoal("quality", "Qualität", GoalMetricProfile(coherence=1.0)))
+        engine.add_fact(make_fact("Evidenz", 0.9, fact_id="evidence"))
+        engine.add_rule(make_implication_rule("derive", ("evidence",), "Folgerung", certainty=0.8))
+        engine.run_inference()
+        return engine
+
+    def test_state_roundtrip_preserves_declarative_digest_but_not_callbacks(self) -> None:
+        engine = self._engine_with_state()
+        exported = engine.export_state()
+        restored = UniversalBrainCore.from_state(exported)
+        self.assertEqual(restored.state_digest(), engine.state_digest())
+        self.assertEqual(set(restored.facts), set(engine.facts))
+        self.assertEqual(restored.goals, engine.goals)
+        self.assertEqual(set(restored.derivations), set(engine.derivations))
+        self.assertFalse(restored.rules)
+        self.assertIn("derive", restored.rule_manifest)
+        self.assertFalse(restored.rule_manifest["derive"]["registered"])
+        self.assertTrue(restored.inspect_integrity().valid)
+
+    def test_state_import_detects_tampering(self) -> None:
+        engine = self._engine_with_state()
+        envelope = json.loads(engine.export_state())
+        envelope["state"]["facts"][0]["content"] = "Manipulierte Evidenz"
+        with self.assertRaises(EngineError):
+            UniversalBrainCore.from_state(json.dumps(envelope))
+        restored = UniversalBrainCore.from_state(json.dumps(envelope), verify=False)
+        self.assertIn("Manipulierte Evidenz", {fact.content for fact in restored.facts.values()})
+
+    def test_state_export_without_audit_reimports_cleanly(self) -> None:
+        engine = self._engine_with_state()
+        envelope = json.loads(engine.export_state(include_audit=False))
+        self.assertEqual(envelope["state"]["audit"], [])
+        restored = UniversalBrainCore.from_state(json.dumps(envelope))
+        self.assertEqual(restored.audit_trail, ())
+        self.assertTrue(restored.inspect_integrity().valid)
+
+    def test_rule_manifest_rejects_callback_markers_even_with_matching_digest(self) -> None:
+        engine = self._engine_with_state()
+        envelope = json.loads(engine.export_state())
+        envelope["state"]["rule_manifest"][0]["action"] = "not-a-callback"
+        state = envelope["state"]
+        envelope["integrity"]["sha256"] = UniversalBrainCore._digest_payload(state)
+        with self.assertRaises(EngineError):
+            UniversalBrainCore.from_state(json.dumps(envelope))
+
+    def test_atomic_batch_rejects_all_on_internal_or_existing_collision(self) -> None:
+        engine = UniversalBrainCore()
+        first = make_fact("Erster Fakt", 0.8, fact_id="first")
+        duplicate = make_fact("  erster  fakt ", 0.9, fact_id="duplicate")
+        self.assertEqual(engine.add_facts((first, duplicate)), ())
+        self.assertFalse(engine.facts)
+
+        engine.add_fact(make_fact("Geschützte Evidenz", 0.9, fact_id="protected"))
+        inferior = make_fact("Geschützte Evidenz", 0.4, fact_id="inferior")
+        independent = make_fact("Unabhängiger Fakt", 0.8, fact_id="independent")
+        self.assertEqual(engine.add_facts((inferior, independent)), ())
+        self.assertEqual(set(engine.facts), {"protected"})
+
+    def test_atomic_batch_accepts_independent_facts(self) -> None:
+        engine = UniversalBrainCore()
+        accepted = engine.add_facts(
+            (
+                make_fact("Fakt A", 0.8, fact_id="a"),
+                make_fact("Fakt B", 0.7, fact_id="b"),
+            )
+        )
+        self.assertEqual(accepted, ("a", "b"))
+        self.assertTrue(engine.inspect_integrity().valid)
+
+    def test_explanations_expose_missing_sources_and_cycles_without_recursion_failure(self) -> None:
+        engine = UniversalBrainCore()
+        engine.add_fact(make_fact("Fakt mit externer Quelle", 0.8, fact_id="external", sources=("missing-source",)))
+        missing_explanation = engine.explain_fact("external")
+        self.assertTrue(missing_explanation.children[0].missing)
+
+        engine.add_fact(make_fact("Zyklischer Fakt", 0.8, fact_id="cycle", sources=("cycle",)))
+        cycle_explanation = engine.explain_fact("cycle", max_depth=4)
+        self.assertTrue(cycle_explanation.children[0].cycle_detected)
+        self.assertTrue(engine.explain_fact("cycle", max_depth=0).truncated)
+
+    def test_internal_conflicts_and_integrity_report_are_explicit(self) -> None:
+        engine = UniversalBrainCore()
+        engine.add_fact(make_fact("Ventil ist offen.", 0.8, fact_id="open", claim="ventil", polarity=True))
+        engine.add_fact(make_fact("Ventil ist geschlossen.", 0.7, fact_id="closed", claim="ventil", polarity=False))
+        conflicts = engine.detect_internal_conflicts()
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].true_fact_ids, ("open",))
+        self.assertEqual(conflicts[0].false_fact_ids, ("closed",))
+        report = engine.inspect_integrity()
+        self.assertTrue(report.valid)
+        self.assertEqual(report.fact_count, 2)
+
+    def test_integrity_report_detects_corrupted_private_index_without_mutating_state(self) -> None:
+        engine = UniversalBrainCore()
+        engine.add_fact(make_fact("Indexierter Fakt", 0.8, fact_id="indexed", sources=("source",)))
+        engine._source_index.clear()
+        report = engine.inspect_integrity()
+        self.assertFalse(report.valid)
+        self.assertIn("source_index_mismatch", report.issues)
 
 
 class MetaRuleTests(unittest.TestCase):

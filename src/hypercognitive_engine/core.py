@@ -11,6 +11,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
+from hmac import compare_digest
 from itertools import combinations
 import json
 import math
@@ -22,6 +23,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from uuid import uuid4
 
 MAX_INTENSITY = 1e12
+STATE_SCHEMA = "hypercognitive-engine-state/1"
 
 
 class EngineError(RuntimeError):
@@ -322,6 +324,43 @@ class SynthesisResult:
     min_support: float
 
 
+@dataclass(frozen=True, slots=True)
+class FactConflict:
+    """Gegensätzliche explizite Polaritäten innerhalb desselben Faktenraums."""
+
+    claim_key: str
+    true_fact_ids: tuple[str, ...]
+    false_fact_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExplanationNode:
+    """Begrenzter, zyklussicherer Knoten eines Faktenerklärungsbaums."""
+
+    fact_id: str
+    content: Optional[str]
+    generation: Optional[int]
+    rule_id: Optional[str]
+    source_ids: tuple[str, ...]
+    children: tuple["ExplanationNode", ...]
+    missing: bool = False
+    truncated: bool = False
+    cycle_detected: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrityReport:
+    """Nichtmutierender Konsistenz- und Integritätsbefund eines Engine-Zustands."""
+
+    valid: bool
+    state_digest: str
+    issues: tuple[str, ...]
+    fact_count: int
+    goal_count: int
+    derivation_count: int
+    audit_event_count: int
+
+
 class UniversalBrainCore:
     """Thread-sichere Kernengine mit nachvollziehbarer, begrenzter Inferenz."""
 
@@ -337,6 +376,8 @@ class UniversalBrainCore:
         self._semantic_index: dict[tuple[str, Optional[bool]], str] = {}
         self._derivations: dict[str, DerivationRecord] = {}
         self._audit: list[AuditEvent] = []
+        # Deklaratives Regelmanifest aus Imports; es enthält niemals ausführbare Callbacks.
+        self._imported_rule_manifest: dict[str, Mapping[str, Any]] = {}
         self._generation = 0
         self._revision = 0
         self._lock = RLock()
@@ -361,6 +402,23 @@ class UniversalBrainCore:
         with self._lock:
             # Kopien verhindern, dass Aufrufer Priorität oder Efficacy interner Regeln mutieren.
             return MappingProxyType({rule_id: replace(rule) for rule_id, rule in self._rules.items()})
+
+    @property
+    def rule_manifest(self) -> Mapping[str, Mapping[str, Any]]:
+        """Deklarative Regelmetadaten; Callbacks werden bewusst nie offengelegt oder serialisiert."""
+        with self._lock:
+            manifest = {rule_id: dict(metadata) for rule_id, metadata in self._imported_rule_manifest.items()}
+            for rule_id, rule in self._rules.items():
+                manifest[rule_id] = {
+                    "id": rule.id,
+                    "priority": rule.priority,
+                    "efficacy": rule.efficacy,
+                    "generation": rule.generation,
+                    "execution_count": rule.execution_count,
+                    "last_used": rule.last_used,
+                    "registered": True,
+                }
+            return MappingProxyType({key: MappingProxyType(dict(manifest[key])) for key in sorted(manifest)})
 
     @property
     def goals(self) -> tuple[TeleologicalGoal, ...]:
@@ -467,6 +525,33 @@ class UniversalBrainCore:
         with self._lock:
             return self._ingest_fact(fact, origin="external")
 
+    def add_facts(self, facts: Iterable[MindFact], *, atomic: bool = True) -> tuple[str, ...]:
+        """Nimmt mehrere Fakten auf; im atomaren Modus wird kein Teilzustand übernommen."""
+        incoming = tuple(facts)
+        if any(not isinstance(fact, MindFact) for fact in incoming):
+            raise ValueError("Nur MindFact-Instanzen können registriert werden.")
+        if not incoming:
+            return ()
+        with self._lock:
+            if not atomic:
+                return tuple(fact.id for fact in incoming if self._ingest_fact(fact, origin="batch"))
+            aligned = tuple(self._with_current_alignment(fact) for fact in incoming)
+            ids = [fact.id for fact in aligned]
+            semantic_keys = [fact.semantic_key for fact in aligned]
+            if len(set(ids)) != len(ids) or len(set(semantic_keys)) != len(semantic_keys):
+                self._record("batch_rejected", reason="duplicate_within_batch", count=len(aligned))
+                return ()
+            for fact in aligned:
+                competitors = [existing for existing in (self._facts.get(fact.id), self._facts.get(self._semantic_index.get(fact.semantic_key, ""))) if existing is not None]
+                if any(self._quality(existing) >= self._quality(fact) for existing in competitors):
+                    self._record("batch_rejected", reason="existing_fact_not_inferior", fact_id=fact.id, count=len(aligned))
+                    return ()
+            accepted = tuple(fact.id for fact in aligned if self._ingest_fact(fact, origin="batch"))
+            if len(accepted) != len(aligned):
+                raise EngineError("Atomare Stapelaufnahme konnte nicht vollständig übernommen werden.")
+            self._record("batch_added", fact_ids=list(accepted), count=len(accepted))
+            return accepted
+
     def _quality(self, fact: MindFact) -> float:
         return fact.certainty * 0.65 + fact.dimensions.goal_alignment * 0.35
 
@@ -518,6 +603,7 @@ class UniversalBrainCore:
             if rule.id in self._rules:
                 raise ValueError(f"Regel {rule.id!r} ist bereits registriert.")
             self._rules[rule.id] = rule
+            self._imported_rule_manifest.pop(rule.id, None)
             self._revision += 1
             self._record("rule_added", rule_id=rule.id)
 
@@ -661,11 +747,11 @@ class UniversalBrainCore:
             raise ValueError("max_edges muss eine positive Ganzzahl sein.")
         with self._lock:
             facts = tuple(self._facts[fact_id] for fact_id in sorted(self._facts))
-            edges = [
-                ResonanceEdge(a.id, b.id, self._resonance_weight(a, b))
-                for a, b in combinations(facts, 2)
-                if self._resonance_weight(a, b) >= threshold
-            ]
+            edges: list[ResonanceEdge] = []
+            for a, b in combinations(facts, 2):
+                weight = self._resonance_weight(a, b)
+                if weight >= threshold:
+                    edges.append(ResonanceEdge(a.id, b.id, weight))
             edges.sort(key=lambda edge: (-edge.weight, edge.fact_a, edge.fact_b))
             result = tuple(edges[:max_edges])
             self._record("resonance_built", edge_count=len(result), threshold=threshold)
@@ -840,6 +926,353 @@ class UniversalBrainCore:
         with self._lock:
             self._record("branches_synthesized", branch_count=len(branches), consensus=len(consensus), conflicts=len(conflicts))
         return result
+
+    @staticmethod
+    def _fact_payload(fact: MindFact) -> dict[str, Any]:
+        return {
+            "id": fact.id,
+            "content": fact.content,
+            "certainty": fact.certainty,
+            "dimensions": {
+                "epistemology": fact.dimensions.epistemology,
+                "entropy": fact.dimensions.entropy,
+                "intensity": fact.dimensions.intensity,
+                "emergence": fact.dimensions.emergence,
+                "goal_alignment": fact.dimensions.goal_alignment,
+            },
+            "generation": fact.generation,
+            "sources": list(fact.sources),
+            "timestamp": fact.timestamp,
+            "claim": fact.claim,
+            "polarity": fact.polarity,
+        }
+
+    @staticmethod
+    def _fact_from_payload(payload: Mapping[str, Any]) -> MindFact:
+        if not isinstance(payload, Mapping):
+            raise EngineError("Ein serialisierter Fakt muss ein Mapping sein.")
+        dimensions = payload.get("dimensions")
+        if not isinstance(dimensions, Mapping):
+            raise EngineError("Ein serialisierter Fakt benötigt dimensions als Mapping.")
+        sources = payload.get("sources", ())
+        if not isinstance(sources, list):
+            raise EngineError("Ein serialisierter Fakt benötigt sources als Liste.")
+        return MindFact(
+            id=payload.get("id"),
+            content=payload.get("content"),
+            certainty=payload.get("certainty"),
+            dimensions=SemanticDimensions(
+                epistemology=dimensions.get("epistemology"),
+                entropy=dimensions.get("entropy"),
+                intensity=dimensions.get("intensity"),
+                emergence=dimensions.get("emergence"),
+                goal_alignment=dimensions.get("goal_alignment"),
+            ),
+            generation=payload.get("generation", 0),
+            sources=tuple(sources),
+            timestamp=payload.get("timestamp"),
+            claim=payload.get("claim"),
+            polarity=payload.get("polarity"),
+        )
+
+    @staticmethod
+    def _goal_payload(goal: TeleologicalGoal) -> dict[str, Any]:
+        return {
+            "id": goal.id,
+            "description": goal.description,
+            "weight": goal.weight,
+            "satisfied": goal.satisfied,
+            "metrics": {
+                "novelty": goal.metrics.novelty,
+                "coherence": goal.metrics.coherence,
+                "predictability": goal.metrics.predictability,
+                "emergence": goal.metrics.emergence,
+            },
+        }
+
+    @staticmethod
+    def _goal_from_payload(payload: Mapping[str, Any]) -> TeleologicalGoal:
+        if not isinstance(payload, Mapping):
+            raise EngineError("Ein serialisiertes Ziel muss ein Mapping sein.")
+        metrics = payload.get("metrics")
+        if not isinstance(metrics, Mapping):
+            raise EngineError("Ein serialisiertes Ziel benötigt metrics als Mapping.")
+        return TeleologicalGoal(
+            id=payload.get("id"),
+            description=payload.get("description"),
+            weight=payload.get("weight", 1.0),
+            satisfied=payload.get("satisfied", False),
+            metrics=GoalMetricProfile(
+                novelty=metrics.get("novelty", 0.25),
+                coherence=metrics.get("coherence", 0.25),
+                predictability=metrics.get("predictability", 0.25),
+                emergence=metrics.get("emergence", 0.25),
+            ),
+        )
+
+    @staticmethod
+    def _canonical_json(payload: Mapping[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    @classmethod
+    def _digest_payload(cls, payload: Mapping[str, Any]) -> str:
+        return sha256(cls._canonical_json(payload).encode("utf-8")).hexdigest()
+
+    def _state_payload(self, *, include_audit: bool) -> dict[str, Any]:
+        return {
+            "runtime": {
+                "max_intensity": self._max_intensity,
+                "generation": self._generation,
+                "revision": self._revision,
+            },
+            "facts": [self._fact_payload(fact) for fact in sorted(self._facts.values(), key=lambda item: item.id)],
+            "goals": [self._goal_payload(goal) for goal in self.goals],
+            "derivations": [
+                {
+                    "fact_id": record.fact_id,
+                    "rule_id": record.rule_id,
+                    "parent_ids": list(record.parent_ids),
+                    "run_id": record.run_id,
+                    "generation": record.generation,
+                    "created_at": record.created_at,
+                }
+                for record in sorted(self._derivations.values(), key=lambda item: item.fact_id)
+            ],
+            "rule_manifest": [
+                {key: value for key, value in self.rule_manifest[rule_id].items() if key != "registered"}
+                for rule_id in sorted(self.rule_manifest)
+            ],
+            "audit": [
+                {"sequence": event.sequence, "kind": event.kind, "timestamp": event.timestamp, "data": dict(event.data)}
+                for event in self._audit
+            ]
+            if include_audit
+            else [],
+        }
+
+    def state_digest(self, *, include_audit: bool = True) -> str:
+        """Liefert den SHA-256-Fingerabdruck eines kanonischen, deklarativen Zustands."""
+        with self._lock:
+            return self._digest_payload(self._state_payload(include_audit=include_audit))
+
+    def export_state(self, *, include_audit: bool = True, indent: Optional[int] = 2) -> str:
+        """Exportiert einen versionierten Zustand mit prüfbarem Digest und ohne Callbacks."""
+        if not isinstance(include_audit, bool):
+            raise ValueError("include_audit muss bool sein.")
+        with self._lock:
+            state = self._state_payload(include_audit=include_audit)
+            envelope = {
+                "schema": STATE_SCHEMA,
+                "state": state,
+                "integrity": {"algorithm": "sha256", "sha256": self._digest_payload(state)},
+            }
+            return json.dumps(envelope, ensure_ascii=False, indent=indent, sort_keys=True, allow_nan=False)
+
+    @classmethod
+    def from_state(cls, serialized: str | Mapping[str, Any], *, verify: bool = True) -> "UniversalBrainCore":
+        """Rekonstruiert deklarative Daten; Regel-Callbacks werden absichtlich nicht wiederhergestellt."""
+        if isinstance(serialized, str):
+            try:
+                envelope = json.loads(serialized)
+            except json.JSONDecodeError as exc:
+                raise EngineError("Der Zustands-Import enthält ungültiges JSON.") from exc
+        elif isinstance(serialized, Mapping):
+            envelope = dict(serialized)
+        else:
+            raise ValueError("serialized muss JSON-Text oder ein Mapping sein.")
+        if not isinstance(envelope, Mapping) or envelope.get("schema") != STATE_SCHEMA:
+            raise EngineError(f"Nicht unterstütztes Zustands-Schema; erwartet wird {STATE_SCHEMA!r}.")
+        state = envelope.get("state")
+        integrity = envelope.get("integrity")
+        if not isinstance(state, Mapping) or not isinstance(integrity, Mapping):
+            raise EngineError("Der Zustands-Import benötigt state und integrity als Mapping.")
+        digest = integrity.get("sha256")
+        if integrity.get("algorithm") != "sha256" or not isinstance(digest, str):
+            raise EngineError("Der Zustands-Import benötigt einen SHA-256-Integritätswert.")
+        expected_digest = cls._digest_payload(state)
+        if verify and not compare_digest(digest, expected_digest):
+            raise EngineError("Der Zustands-Import wurde verändert oder der Integritätswert ist ungültig.")
+
+        runtime = state.get("runtime")
+        facts_payload = state.get("facts")
+        goals_payload = state.get("goals")
+        derivations_payload = state.get("derivations")
+        manifest_payload = state.get("rule_manifest")
+        audit_payload = state.get("audit", [])
+        if not isinstance(runtime, Mapping):
+            raise EngineError("Der Zustands-Import benötigt runtime als Mapping.")
+        if not all(isinstance(value, list) for value in (facts_payload, goals_payload, derivations_payload, manifest_payload, audit_payload)):
+            raise EngineError("Die Zustandslisten facts, goals, derivations, rule_manifest und audit sind erforderlich.")
+        core = cls(max_intensity=runtime.get("max_intensity", MAX_INTENSITY))
+        with core._lock:
+            for payload in goals_payload:
+                goal = cls._goal_from_payload(payload)
+                if goal.id in core._goals:
+                    raise EngineError(f"Doppeltes Ziel im Zustands-Import: {goal.id}")
+                core._goals[goal.id] = goal
+            for payload in facts_payload:
+                fact = cls._fact_from_payload(payload)
+                if fact.id in core._facts or fact.semantic_key in core._semantic_index:
+                    raise EngineError(f"Doppelter Fakt im Zustands-Import: {fact.id}")
+                core._facts[fact.id] = fact
+                core._index_fact(fact)
+            for payload in derivations_payload:
+                if not isinstance(payload, Mapping) or not isinstance(payload.get("parent_ids"), list):
+                    raise EngineError("Eine Ableitung benötigt ein Mapping mit parent_ids als Liste.")
+                record = DerivationRecord(
+                    fact_id=payload.get("fact_id"),
+                    rule_id=payload.get("rule_id"),
+                    parent_ids=tuple(payload["parent_ids"]),
+                    run_id=payload.get("run_id"),
+                    generation=payload.get("generation"),
+                    created_at=payload.get("created_at"),
+                )
+                if record.fact_id not in core._facts or record.fact_id in core._derivations:
+                    raise EngineError(f"Ungültige Ableitungsreferenz im Zustands-Import: {record.fact_id}")
+                core._derivations[record.fact_id] = record
+            for payload in manifest_payload:
+                if not isinstance(payload, Mapping):
+                    raise EngineError("Ein Regelmanifest-Eintrag muss ein Mapping sein.")
+                rule_id = payload.get("id")
+                if not isinstance(rule_id, str) or not rule_id.strip() or rule_id in core._imported_rule_manifest:
+                    raise EngineError("Das Regelmanifest enthält eine ungültige oder doppelte ID.")
+                if "condition" in payload or "action" in payload:
+                    raise EngineError("Regel-Callbacks dürfen niemals aus einem Zustands-Import geladen werden.")
+                core._imported_rule_manifest[rule_id] = MappingProxyType(dict(payload, registered=False))
+            expected_sequence = 1
+            for payload in audit_payload:
+                if not isinstance(payload, Mapping) or not isinstance(payload.get("data"), Mapping):
+                    raise EngineError("Ein Audit-Ereignis muss ein Mapping mit data als Mapping sein.")
+                event = AuditEvent(
+                    sequence=payload.get("sequence"),
+                    kind=payload.get("kind"),
+                    timestamp=payload.get("timestamp"),
+                    data=MappingProxyType(dict(payload["data"])),
+                )
+                if event.sequence != expected_sequence:
+                    raise EngineError("Die Audit-Sequenz im Zustands-Import ist nicht lückenlos.")
+                expected_sequence += 1
+                core._audit.append(event)
+            generation = runtime.get("generation")
+            revision = runtime.get("revision")
+            if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+                raise EngineError("runtime.generation muss eine nichtnegative Ganzzahl sein.")
+            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+                raise EngineError("runtime.revision muss eine nichtnegative Ganzzahl sein.")
+            if generation < max((fact.generation for fact in core._facts.values()), default=0):
+                raise EngineError("runtime.generation darf nicht unter einer Faktengeneration liegen.")
+            core._generation = generation
+            core._revision = revision
+        return core
+
+    def detect_internal_conflicts(self) -> tuple[FactConflict, ...]:
+        """Findet explizite Wahr/Falsch-Widersprüche für denselben normalisierten Claim."""
+        with self._lock:
+            grouped: defaultdict[str, dict[bool, list[str]]] = defaultdict(lambda: defaultdict(list))
+            for fact in self._facts.values():
+                claim_key, polarity = fact.semantic_key
+                if polarity is not None:
+                    grouped[claim_key][polarity].append(fact.id)
+            conflicts = [
+                FactConflict(claim_key, tuple(sorted(polarities[True])), tuple(sorted(polarities[False])))
+                for claim_key, polarities in grouped.items()
+                if True in polarities and False in polarities
+            ]
+            return tuple(sorted(conflicts, key=lambda conflict: conflict.claim_key))
+
+    def explain_fact(self, fact_id: str, *, max_depth: int = 8, max_nodes: int = 128) -> ExplanationNode:
+        """Erzeugt eine begrenzte, zyklussichere Provenienzansicht eines Faktenknotens."""
+        if not isinstance(fact_id, str) or not fact_id.strip():
+            raise ValueError("fact_id darf nicht leer sein.")
+        if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0:
+            raise ValueError("max_depth muss eine nichtnegative Ganzzahl sein.")
+        if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes < 1:
+            raise ValueError("max_nodes muss eine positive Ganzzahl sein.")
+        with self._lock:
+            facts = dict(self._facts)
+            derivations = dict(self._derivations)
+
+        visited_nodes = 0
+
+        def build(current_id: str, path: frozenset[str], depth: int) -> ExplanationNode:
+            nonlocal visited_nodes
+            fact = facts.get(current_id)
+            if fact is None:
+                return ExplanationNode(current_id, None, None, None, (), (), missing=True)
+            if current_id in path:
+                return ExplanationNode(
+                    current_id,
+                    fact.content,
+                    fact.generation,
+                    derivations.get(current_id).rule_id if current_id in derivations else None,
+                    fact.sources,
+                    (),
+                    cycle_detected=True,
+                )
+            visited_nodes += 1
+            record = derivations.get(current_id)
+            source_ids = record.parent_ids if record is not None else fact.sources
+            if visited_nodes >= max_nodes or depth >= max_depth:
+                return ExplanationNode(
+                    current_id,
+                    fact.content,
+                    fact.generation,
+                    record.rule_id if record is not None else None,
+                    source_ids,
+                    (),
+                    truncated=bool(source_ids),
+                )
+            children = tuple(build(source_id, path | {current_id}, depth + 1) for source_id in source_ids)
+            return ExplanationNode(
+                current_id,
+                fact.content,
+                fact.generation,
+                record.rule_id if record is not None else None,
+                source_ids,
+                children,
+            )
+
+        return build(fact_id, frozenset(), 0)
+
+    def inspect_integrity(self) -> IntegrityReport:
+        """Prüft interne Indizes, Audit-Sequenzen und deklarative Invarianten ohne Mutation."""
+        with self._lock:
+            issues: list[str] = []
+            expected_semantics: dict[tuple[str, Optional[bool]], str] = {}
+            expected_sources: defaultdict[str, set[str]] = defaultdict(set)
+            for fact_id, fact in self._facts.items():
+                if fact.id != fact_id:
+                    issues.append(f"fact_id_key_mismatch:{fact_id}")
+                existing = expected_semantics.get(fact.semantic_key)
+                if existing is not None and existing != fact_id:
+                    issues.append(f"duplicate_semantic_key:{fact.semantic_key[0]}")
+                expected_semantics[fact.semantic_key] = fact_id
+                for source in fact.sources:
+                    expected_sources[source].add(fact_id)
+            if dict(self._semantic_index) != expected_semantics:
+                issues.append("semantic_index_mismatch")
+            if {key: set(value) for key, value in self._source_index.items()} != dict(expected_sources):
+                issues.append("source_index_mismatch")
+            for fact_id, record in self._derivations.items():
+                if fact_id not in self._facts or record.fact_id != fact_id:
+                    issues.append(f"derivation_mismatch:{fact_id}")
+            for expected_sequence, event in enumerate(self._audit, start=1):
+                if event.sequence != expected_sequence:
+                    issues.append(f"audit_sequence_mismatch:{expected_sequence}")
+            for rule_id, metadata in self._imported_rule_manifest.items():
+                if rule_id in self._rules:
+                    issues.append(f"shadowed_imported_rule_manifest:{rule_id}")
+                if "condition" in metadata or "action" in metadata:
+                    issues.append(f"unsafe_rule_manifest:{rule_id}")
+            return IntegrityReport(
+                valid=not issues,
+                state_digest=self._digest_payload(self._state_payload(include_audit=True)),
+                issues=tuple(sorted(issues)),
+                fact_count=len(self._facts),
+                goal_count=len(self._goals),
+                derivation_count=len(self._derivations),
+                audit_event_count=len(self._audit),
+            )
 
     def export_audit(self, *, indent: Optional[int] = 2) -> str:
         """Erzeugt einen JSON-Export ohne serialisierte Regel-Callbacks."""
@@ -1022,10 +1455,14 @@ __all__ = [
     "Conflict",
     "DerivationRecord",
     "EngineError",
+    "ExplanationNode",
+    "FactConflict",
     "GoalMetricProfile",
+    "IntegrityReport",
     "InferenceBudget",
     "InferenceReport",
     "MAX_INTENSITY",
+    "STATE_SCHEMA",
     "MindFact",
     "ResonanceEdge",
     "SemanticDimensions",
